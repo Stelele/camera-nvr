@@ -1,0 +1,66 @@
+# Frigate NVR + Cloudflare R2 archival.
+#
+#   camera --RTSP--> frigate --local disk (2d rolling) --> r2-sync --copy--> R2
+#
+# Run:  docker compose up -d
+# Logs: docker compose logs -f frigate
+
+services:
+  frigate:
+    image: ghcr.io/blakeblackshear/frigate:stable
+    container_name: frigate
+    restart: unless-stopped
+    # VAAPI needs a real /dev/dri, and ffmpeg needs shared memory to work.
+    shm_size: 2gb
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - render
+      - video
+    ports:
+      - "5000:5000"   # web UI
+      - "8554:8554"   # restreamed RTSP
+    environment:
+      # Consumed by the {FRIGATE_*} substitutions in frigate/config.yml
+      FRIGATE_CAM_MAIN_URL: ${FRIGATE_CAM_MAIN_URL}
+      FRIGATE_CAM_SUB_URL: ${FRIGATE_CAM_SUB_URL}
+      TZ: ${TZ:-Africa/Johannesburg}
+    volumes:
+      - ./frigate/config.yml:/config/config.yml:ro
+      - /media/frigate:/media/frigate
+    env_file:
+      - .env
+
+  r2-sync:
+    image: rclone/rclone:latest
+    container_name: frigate-r2-sync
+    restart: unless-stopped
+    depends_on:
+      - frigate
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        # r2-sync.sh writes the rclone config from the R2_* env vars on each run,
+        # so there is no hand-edited rclone config to keep in sync. This matches
+        # the R2_* convention used across the other projects — and rclone never
+        # negotiates the streaming chunked payload the AWS SDK does, which is
+        # exactly why rclone is the right tool here.
+        INTERVAL=$${R2_SYNC_INTERVAL_MINUTES:-15}
+        echo "archiving to R2 bucket '$${R2_BUCKET:-camera-archive}' every $${INTERVAL}m"
+        while true; do
+          /scripts/r2-sync.sh || echo "archive pass failed, retrying next cycle"
+          sleep "$${INTERVAL}m"
+        done
+    environment:
+      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY}
+      R2_BUCKET: ${R2_BUCKET}
+      R2_ENDPOINT: ${R2_ENDPOINT}
+      R2_SYNC_INTERVAL_MINUTES: ${R2_SYNC_INTERVAL_MINUTES:-15}
+    volumes:
+      - ./rclone:/scripts:ro
+      - /media/frigate:/media/frigate:ro
+    env_file:
+      - .env

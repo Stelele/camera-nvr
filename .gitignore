@@ -1,0 +1,14 @@
+# Large binaries and generated artifacts — never committed
+tools/
+apk/
+jadx-out/
+captures/
+
+# Local secrets
+.env
+
+# Runtime
+/media/
+*.log
+*.db
+__pycache__/

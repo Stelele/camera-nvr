@@ -1,0 +1,78 @@
+# Frigate config for the Yoosee C173 dual-lens camera.
+#
+# Stream facts, measured from the camera (not guessed):
+#   /onvif1  HEVC 1920x2160 @25fps + PCMA 16kHz mono   ~943 kbps
+#   /onvif2  HEVC 864x976  @25fps                     ~214 kbps
+#
+# 1920x2160 is the two 1080p lenses stitched into ONE frame. There are no
+# separate per-lens RTSP URLs. Only /onvif1 and /onvif2 exist; everything
+# else returns 400.
+
+mqtt:
+  enabled: false
+
+ffmpeg:
+  # Intel integrated graphics. Requires /dev/dri passed through (see compose).
+  # If decode fails on the laptop, try `preset-qsv` or delete this line for
+  # software decode (slower, but always works).
+  hwaccel_args: preset-vaapi
+
+detectors:
+  cpu:
+    type: cpu
+
+record:
+  enabled: true
+  # Local disk is a short rolling window only. R2 is the archive of record —
+  # see docs/FINDINGS.md for why retention is split across the two.
+  # Retention is per-category; there is no top-level `retain` key.
+  motion:
+    days: 2
+  alerts:
+    retain:
+      days: 2
+  detections:
+    retain:
+      days: 2
+
+# In this Frigate version `snapshots` is a top-level section, not under `record`.
+snapshots:
+  enabled: true
+  retain:
+    default: 2
+
+go2rtc:
+  streams:
+    cam_main: "{FRIGATE_CAM_MAIN_URL}"
+    cam_sub: "{FRIGATE_CAM_SUB_URL}"
+
+cameras:
+  cam_front:
+    ffmpeg:
+      inputs:
+        # Detect on the low-res stream. Running detection on 1920x2160 would
+        # cost ~10x the CPU for no accuracy gain on a fixed scene.
+        - path: rtsp://127.0.0.1:8554/cam_sub
+          roles:
+            - detect
+        # Record the full-resolution stitched stream.
+        - path: rtsp://127.0.0.1:8554/cam_main
+          roles:
+            - record
+            - audio
+    detect:
+      width: 864
+      height: 976
+      fps: 5
+    motion:
+      threshold: 30
+      # A fixed outdoor mount generates constant noise, so this is a high
+      # threshold. Detection drives alerts; motion only gates them.
+    objects:
+      track:
+        - person
+        # `vehicle` is NOT a COCO label and is silently dropped by Frigate with
+        # only a warning — the default model here is ssdlite_mobilenet_v2 against
+        # coco_91cl, whose vehicle labels are `car`, `bus`, `train`, `boat`.
+        - car
+        - bus
