@@ -24,8 +24,8 @@ services:
       # Consumed by the {FRIGATE_*} substitutions in frigate/config.yml
       FRIGATE_CAM_MAIN_URL: ${FRIGATE_CAM_MAIN_URL}
       FRIGATE_CAM_SUB_URL: ${FRIGATE_CAM_SUB_URL}
-      FRIGATE_RETAIN_DAYS: ${FRIGATE_RETAIN_DAYS:-14}
-      FRIGATE_SNAPSHOT_DAYS: ${FRIGATE_SNAPSHOT_DAYS:-14}
+      FRIGATE_RETAIN_DAYS: ${FRIGATE_RETAIN_DAYS:-10}
+      FRIGATE_SNAPSHOT_DAYS: ${FRIGATE_SNAPSHOT_DAYS:-30}
       TZ: ${TZ:-Africa/Johannesburg}
     volumes:
       - ./frigate/config.yml:/config/config.yml:ro
