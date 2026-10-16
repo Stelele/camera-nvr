@@ -100,9 +100,27 @@ Once enabled, the server changed behaviour observably: `Allow:` became `Public:`
 
 Everything else returns `400`. The username is `admin` — **not** the app login.
 
-**1920×2160 is the dual lens stitched into one frame** — two 1080p sensors.
-There are no separate per-lens RTSP URLs. The "Double Screen and Double Channel"
-box claim is marketing for a single combined image, not two addressable streams.
+**1920×2160 is two independent 1080p sensors stacked vertically — not one
+stitched image.** This was stated wrongly here at first, as "the dual lens
+stitched into one frame", which implies a seamless panorama. A frame extracted
+from the capture disproved it:
+
+```
+┌─────────────────────────────┐
+│ 15:47:11                    │  ← each half burns its OWN clock
+│   sensor A — points at X    │
+├─────────────────────────────┤  ← hard seam at y=1080, no blend
+│ 15:47:14                    │  ← its own clock, 3 s apart
+│   sensor B — points at Y    │
+└─────────────────────────────┘
+```
+
+A stitch shares one clock and one scene. These are two imagers roughly 90° apart
+in one housing, so **the frame holds two unrelated views**, and the effective
+detail per sensor is 1920×1080. Any analysis must crop to one half first.
+
+There are still no separate per-lens RTSP URLs. The "Double Screen and Double
+Channel" box claim is marketing for this composite.
 
 ### Gotchas that will bite
 
@@ -130,21 +148,37 @@ Captured 10 s of each stream and measured with ffprobe:
 | `/onvif1` 1920×2160 | **943 kbps** | 9.49 GB | 66.4 GB | 285 GB | 854 GB |
 | `/onvif2` 864×976 | **214 kbps** | 2.15 GB | 15.1 GB | 64.5 GB | 194 GB |
 
-### Cloudflare R2 cost
+The main figure is the whole container. Broken out with ffprobe, **128 kbps of it
+is PCMA audio** — a fixed 1.29 GB/day, 471 GB/year, for a 16 kHz mono G.711
+channel. The video is ~815 kbps.
 
-Storage is $0.015/GB-month with **no egress fees** — that is R2's whole
-advantage, and it is what makes offsite surveillance archive viable.
+### Local-only, so retention is a disk decision
 
-| Window | Size | Storage | Writes | Total |
-|---|---|---|---|---|
-| 7 days | 66 GB | $1.00 | $0.01 | **~$1.01/mo** |
-| 30 days | 285 GB | $4.27 | $0.05 | **~$4.32/mo** |
-| 90 days | 854 GB | $12.81 | $0.16 | **~$12.96/mo** |
+This build originally archived to Cloudflare R2 and costed it there (~$13/month
+for 90 days, no egress fees). R2 was then dropped in favour of local-only
+recording, which removes the cost question and replaces it with a disk one:
+
+| Days kept | Disk needed |
+|---|---|
+| 7 | 66 GB |
+| 10 | 95 GB |
+| 14 | 133 GB |
+| 30 | 285 GB |
+| 60 | 569 GB |
+| 90 | 854 GB |
+
+There is no lifecycle policy to fall back on any more — `FRIGATE_RETAIN_DAYS`
+above the disk's capacity means Frigate evicts early rather than failing.
+
+### Motion gating is useless here
+
+The standard storage lever — record only on motion — does not apply to a poultry
+house. Broilers peck and shuffle constantly, so motion fires on nearly every
+frame. The pipeline records continuously and pays the full rate either way.
 
 ### Compression is the wrong lever
 
-Three months of complete offsite archive costs **about $13/month**. Compression
-buys nothing worth having:
+Compression buys nothing worth having here:
 
 - The stream is **already HEVC** at 943 kbps for 4.1 megapixels. That is efficient.
 - Re-encoding is HEVC→HEVC: typically 20–30% smaller at best, with visible
@@ -152,13 +186,12 @@ buys nothing worth having:
 - **Transcoded footage is weaker as evidence** — in an insurance dispute or any
   proceeding, an untouched capture is worth materially more than a squeezed one.
 
-Recommendation: record untouched, archive untouched, let retention policy handle
-ageing. Note this figure is analytic — the local FFmpeg build is
-`--disable-decoder=h264,hevc,vc1,vvc` (RPM patent build), so re-encoding could
-not actually be benchmarked on this machine.
+Record untouched and let retention handle ageing. Note the reasoning is
+analytic — the local FFmpeg build is `--disable-decoder=h264,hevc,vc1,vvc` (RPM
+patent build), so re-encoding could not be benchmarked on this machine.
 
-If storage must be cut instead, record the **sub** stream (4.4× smaller) — but
-864×976 is too low to identify anyone, so that trades the point of the camera.
+If storage must be cut, the honest levers are dropping the audio role (13.6%) or
+recording the sub stream (4.4× smaller, at half the detail per sensor).
 
 ---
 
@@ -180,39 +213,36 @@ should not be reused as the app account password.
 
 ---
 
-## 7. The `rclone copy` vs `rclone sync` trap
+## 7. Why the cloud archive was dropped
 
-The most dangerous bug in this build is the one that does not error.
+The first build archived to Cloudflare R2 with an rclone sidecar. It was removed
+in favour of local-only recording, because the footage is watched on the same
+machine that captures it and an offsite copy answering no question the local one
+did not.
 
-Frigate keeps a short rolling local window. `rclone sync` makes the destination
-match the source *exactly*, **including deletions**. Point it at a rolling local
-directory and it will erase the entire R2 archive every time local retention
-lapses — silently, while appearing to succeed.
+The lesson from that build is kept because it generalises: **`rclone sync`
+against a rolling source deletes the destination.** Frigate's local window ages
+out, `sync` makes the destination match the source *exactly including deletions*,
+and the entire archive is erased every time retention lapses — silently, while
+reporting success. `copy` only adds and updates and can never delete; expiry
+belongs to a lifecycle policy, not to a transfer.
 
-`r2-sync.sh` therefore uses **`rclone copy`**, which only adds and updates.
-Expiry is an R2 lifecycle policy on the bucket, not a side effect of a sync.
-
-### R2 + AWS SDK note
-
-R2 does not implement the streaming chunked payload the AWS SDK negotiates by
-default (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`) — hence
-`DisablePayloadSigning = true` in `njeremoto-operations`. **rclone is not the AWS
-SDK and never negotiates it**, so no equivalent flag is needed. That discrepancy
-is precisely why rclone is the right tool here.
+That reasoning is preserved on the hivemind board. It is recorded here rather
+than implemented, since nothing in this repo archives any more.
 
 ---
 
-## 8. Three ways this build lied while looking fine
+## 8. Two ways this build lied while looking fine
 
-Every one of these passed every check available at the time it was written. All
-three were caught only by executing the real thing.
+Both passed every check available when they were written. Both were caught only
+by executing the real thing.
 
 ### 8.1 A label that silently does not exist
 
 `objects.track: [person, vehicle]`. `vehicle` is a plausible English word and
 Frigate's own docs use it — but the default model is
-`ssdlite_mobilenet_v2` against `coco_91cl`, whose labels are `car`, `bus`,
-`train`, `boat`, `motorcycle`. There is no `vehicle`.
+`ssdlite_mobilenet_v2` against `coco_91cl`, whose vehicle labels are `car`,
+`bus`, `train`, `boat`, `motorcycle`. There is no `vehicle`.
 
 Frigate does not error. It logs one WARNING, **drops the label from the track
 list, and keeps running** — so the config validates, the UI looks configured, and
@@ -226,26 +256,7 @@ docker run --rm --entrypoint sh ghcr.io/blakeblackshear/frigate:stable \
   -c "grep -nxE 'car|bus|truck|vehicle' /openvino-model/coco_91cl_bkgr.txt"
 ```
 
-### 8.2 A config file that was mounted but never read
-
-The sidecar mounted the rclone config at `/config/r2.conf` and ran bare
-`rclone copy`. rclone does **not** look there — its default is
-`/config/rclone/rclone.conf`. With no config found it prints
-
-```
-NOTICE: Config file "/config/rclone/rclone.conf" not found - using defaults
-```
-
-and then every command fails with `didn't find section in config file ("r2")` —
-an error about the *remote*, when the real problem is the file's location. The
-upload never worked and the log blamed the credentials.
-
-Two traps stacked here: the wrong path, and `/config` not existing in the
-`rclone/rclone` image at all, so writing the config failed too.
-
-Fix: export `RCLONE_CONFIG` explicitly and `mkdir -p` its directory.
-
-### 8.3 A bind mount that turns a missing file into a directory
+### 8.2 A bind mount turns a missing file into a directory
 
 ```yaml
 volumes:
@@ -253,12 +264,13 @@ volumes:
 ```
 
 With `r2.conf` absent, Docker **creates a directory at that path** so the mount
-succeeds. Now `cp r2.conf.template r2.conf` fails ("is a directory"), and
-`test -f /config/r2.conf` is false forever. The fix for the missing file makes
-the missing file permanent.
+succeeds. The documented fix — `cp r2.conf.template r2.conf` — then fails with
+"is a directory", and `test -f /config/r2.conf` is false forever. The remedy for
+the missing file makes the missing file permanent.
 
-Removed by not bind-mounting the config at all — it is generated at run time
-from `R2_*` in `.env`, which also removes the second place to keep secrets.
+The same trap sits under any file bind mount, which is why the recordings mount
+in `docker-compose.yml` points at a **directory** (`./media`) that is committed
+empty via `.gitkeep`, rather than at a path Docker is left to invent.
 
 ### The shared shape
 
@@ -270,5 +282,4 @@ from `R2_*` in `.env`, which also removes the second place to keep secrets.
 
 Every validator answers "is this shaped correctly", never "does this work". A
 config file is a claim about behaviour, and the only instrument that settles it
-is running the real path — which is why §7's `copy`/`sync` distinction had to be
-reasoned about rather than discovered by a crash.
+is running the real path.

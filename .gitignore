@@ -7,8 +7,11 @@ captures/
 # Local secrets
 .env
 
+# Recordings — bind-mounted into the container
+media/*
+!media/.gitkeep
+
 # Runtime
-/media/
 *.log
 *.db
 __pycache__/

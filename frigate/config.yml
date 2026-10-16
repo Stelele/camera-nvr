@@ -1,19 +1,20 @@
-# Frigate config for the Yoosee C173 dual-lens camera.
+# Frigate config for the Yoosee C173 dual-lens camera, local recording only.
 #
 # Stream facts, measured from the camera (not guessed):
-#   /onvif1  HEVC 1920x2160 @25fps + PCMA 16kHz mono   ~943 kbps
+#   /onvif1  HEVC 1920x2160 @25fps + PCMA 16kHz mono   ~943 kbps (128 of it audio)
 #   /onvif2  HEVC 864x976  @25fps                     ~214 kbps
 #
-# 1920x2160 is the two 1080p lenses stitched into ONE frame. There are no
-# separate per-lens RTSP URLs. Only /onvif1 and /onvif2 exist; everything
-# else returns 400.
+# 1920x2160 is TWO independent 1080p sensors stacked vertically, NOT a seamless
+# stitch. Each half carries its own clock and points ~90 degrees from the other,
+# so the frame contains two unrelated scenes. Crop to one 1920x1080 half before
+# any analysis. Only /onvif1 and /onvif2 exist; everything else returns 400.
 
 mqtt:
   enabled: false
 
 ffmpeg:
   # Intel integrated graphics. Requires /dev/dri passed through (see compose).
-  # If decode fails on the laptop, try `preset-qsv` or delete this line for
+  # If decode fails on the laptop, try `preset-qsv`, or delete this line for
   # software decode (slower, but always works).
   hwaccel_args: preset-vaapi
 
@@ -23,23 +24,28 @@ detectors:
 
 record:
   enabled: true
-  # Local disk is a short rolling window only. R2 is the archive of record —
-  # see docs/FINDINGS.md for why retention is split across the two.
-  # Retention is per-category; there is no top-level `retain` key.
+  # Retention, in days, comes from FRIGATE_RETAIN_DAYS. Local disk is the only
+  # store, so this is the whole retention policy — size it to the disk.
+  #
+  # Recording is continuous: broilers move constantly, so motion gating rejects
+  # almost nothing while making the resulting archive harder to reason about.
+  # See docs/FINDINGS.md 5 for the measured per-day volumes behind this choice.
+  continuous:
+    days: "{FRIGATE_RETAIN_DAYS}"
   motion:
-    days: 2
+    days: "{FRIGATE_RETAIN_DAYS}"
   alerts:
     retain:
-      days: 2
+      days: "{FRIGATE_RETAIN_DAYS}"
   detections:
     retain:
-      days: 2
+      days: "{FRIGATE_RETAIN_DAYS}"
 
 # In this Frigate version `snapshots` is a top-level section, not under `record`.
 snapshots:
   enabled: true
   retain:
-    default: 2
+    default: "{FRIGATE_SNAPSHOT_DAYS}"
 
 go2rtc:
   streams:
@@ -47,7 +53,7 @@ go2rtc:
     cam_sub: "{FRIGATE_CAM_SUB_URL}"
 
 cameras:
-  cam_front:
+  cam_house:
     ffmpeg:
       inputs:
         # Detect on the low-res stream. Running detection on 1920x2160 would
@@ -55,7 +61,7 @@ cameras:
         - path: rtsp://127.0.0.1:8554/cam_sub
           roles:
             - detect
-        # Record the full-resolution stitched stream.
+        # Record the full-resolution main stream, with its audio channel.
         - path: rtsp://127.0.0.1:8554/cam_main
           roles:
             - record
@@ -66,13 +72,16 @@ cameras:
       fps: 5
     motion:
       threshold: 30
-      # A fixed outdoor mount generates constant noise, so this is a high
-      # threshold. Detection drives alerts; motion only gates them.
+      # A fixed indoor mount on a litter floor. Detection drives review items;
+      # motion only gates them.
     objects:
       track:
+        # Deliberately minimal. A dense flock of a hundred birds is not a set of
+        # countable objects to this detector — occlusion merges them into blobs,
+        # and per-bird inference on CPU is expensive for no gain. Continuous
+        # recording is the pipeline; object tracking is for the rare human.
+        #
+        # `bird` and `vehicle` are checked against the model labelmap rather
+        # than assumed: `vehicle` is not a COCO label at all and Frigate drops
+        # it with only a warning, leaving the feature silently absent.
         - person
-        # `vehicle` is NOT a COCO label and is silently dropped by Frigate with
-        # only a warning — the default model here is ssdlite_mobilenet_v2 against
-        # coco_91cl, whose vehicle labels are `car`, `bus`, `train`, `boat`.
-        - car
-        - bus
