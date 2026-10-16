@@ -1,15 +1,15 @@
 # camera-nvr
 
-Self-hosted NVR for a Yoosee C173 dual-lens WiFi camera. Frigate records locally;
-recordings and event clips archive to a Cloudflare R2 bucket.
+Self-hosted NVR for a Yoosee C173 dual-lens WiFi camera, recording **locally
+only**. No cloud bucket, no offsite copy — the laptop that lives with the camera
+is the archive.
 
-Built for a spare laptop (Intel integrated graphics) that lives with the camera
-rather than travelling with you.
+Built for a spare laptop (Intel integrated graphics) watching a small broiler
+house. Analysis of the footage is a separate project; this repo is the capture
+pipeline.
 
 ```
-camera ──RTSP──> Frigate ──> local disk (2-day rolling)
-                             │
-                             └──rclone copy──> Cloudflare R2 (long-term archive)
+camera ──RTSP──> Frigate ──> local disk (rolling window, default 14 days)
 ```
 
 ---
@@ -32,6 +32,8 @@ docker run --rm \
   -v "$PWD/frigate/config.yml:/config/config.yml:ro" \
   -e FRIGATE_CAM_MAIN_URL="$FRIGATE_CAM_MAIN_URL" \
   -e FRIGATE_CAM_SUB_URL="$FRIGATE_CAM_SUB_URL" \
+  -e FRIGATE_RETAIN_DAYS="$FRIGATE_RETAIN_DAYS" \
+  -e FRIGATE_SNAPSHOT_DAYS="$FRIGATE_SNAPSHOT_DAYS" \
   --entrypoint python3 ghcr.io/blakeblackshear/frigate:stable \
   -u -m frigate --validate-config
 ```
@@ -51,8 +53,8 @@ Fill these in before `docker compose up`:
 |---|---|
 | `CAM_RTSP_PASSWORD_ENCODED` | **Percent-encode it.** `@` must be `%40`; a literal `@` fails *silently* |
 | `FRIGATE_CAM_MAIN_URL` / `_SUB_URL` | Built from the password above |
-| `R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | All three required — the sidecar refuses to start without them and names the missing one |
-| `R2_BUCKET` | Archive bucket name |
+| `FRIGATE_MEDIA_PATH` | Point at a large disk on the laptop |
+| `FRIGATE_RETAIN_DAYS` | This is the whole retention policy — see Storage |
 
 Two gotchas that cost real time, both detailed in `.env`:
 
@@ -74,49 +76,91 @@ Detection runs on the sub stream, recording on the main stream. Running detectio
 on 1920×2160 would cost roughly ten times the CPU for no accuracy gain on a
 fixed scene.
 
-1920×2160 is the **two lenses stitched into a single frame**. There are no
-separate per-lens URLs — the "Double Screen and Double Channel" box claim is one
-combined image, not two addressable streams.
+### The main stream is two cameras, not one wide shot
+
+`1920×2160` is **two independent 1080p sensors stacked vertically**, and the two
+halves are *not* a seamless stitch:
+
+```
+┌─────────────────────────────┐
+│ 15:47:11                    │  ← its own clock overlay
+│   sensor A — points at X    │
+├─────────────────────────────┤  ← hard seam at y=1080, no blend
+│ 15:47:14                    │  ← a different clock, 3s apart
+│   sensor B — points at Y    │
+└─────────────────────────────┘
+        1920 × 2160
+```
+
+A stitch would share one clock and one scene. These are two imagers ~90° apart
+sharing a housing, so **the frame contains two unrelated views**. Effective
+detail per sensor is 1920×1080, not 1920×2160.
+
+Consequences:
+
+- Any analysis must **crop to one 1920×1080 half** first. Feeding a detector the
+  full frame gives it two scenes at once.
+- The "Double Screen and Double Channel" box claim is marketing for this
+  composite, not two addressable streams. There are no per-lens RTSP URLs.
+
+### Detection is deliberately minimal
+
+Only `person` is tracked. A dense flock is not a set of countable objects to a
+COCO detector — occlusion merges birds into blobs, and per-bird inference on CPU
+is expensive for no gain. **Continuous recording is the pipeline**; object
+tracking is there for the rare human.
+
+Note the label list is checked against the model's labelmap, not assumed:
+`vehicle` is not a COCO label at all and Frigate drops it with only a warning,
+leaving the feature silently absent.
 
 ---
 
-## Cost
+## Storage
 
-Measured from a real 10-second capture of this camera, not estimated:
+Local disk is the only store, so retention is sized to the disk. Measured from a
+real capture of this camera, not estimated:
 
-| Stream | Bitrate | Per day | 90 days |
+| Stream | Bitrate | Per day | Per year |
 |---|---|---|---|
-| Main 1920×2160 | 943 kbps | 9.49 GB | 854 GB |
+| Main 1920×2160 (video + audio) | 943 kbps | 9.5 GB | 3.46 TB |
+| — of which audio (PCMA 16 kHz) | 128 kbps | 1.3 GB | 471 GB |
+| Main, video only | ~815 kbps | 8.2 GB | 3.0 TB |
+| Sub 864×976 | 214 kbps | 2.2 GB | 785 GB |
 
-R2 at $0.015/GB-month with **no egress fees**:
+Disk needed at each retention window (main stream):
 
-| Window | Size | Cost |
-|---|---|---|
-| 7 days | 66 GB | ~$1.01/mo |
-| 30 days | 285 GB | ~$4.32/mo |
-| 90 days | 854 GB | ~$12.96/mo |
+| Days | Disk |
+|---|---|
+| 7 | 66 GB |
+| 10 | 95 GB |
+| 14 | 133 GB |
+| 30 | 285 GB |
+| 60 | 569 GB |
+| 90 | 854 GB |
 
-Do not add compression. The stream is already HEVC; re-encoding costs CPU,
-degrades the image, and **transcoded footage is weaker as evidence**.
+Two levers if that is too much:
+
+- **Drop the `audio` role** in `frigate/config.yml` — saves 1.3 GB/day (13.6%),
+  at the cost of never having the audio channel again. Irreversible, so decide
+  before you start recording in earnest.
+- **Record the sub stream instead** — 4.4× smaller, but 864×976 is half the
+  detail and the composite is only 864×488 per sensor.
+
+Do not transcode to save space. The stream is already HEVC; re-encoding is a
+quality loss, a CPU cost on a laptop, and leaves you with weaker evidence than
+the untouched capture.
 
 ---
 
 ## Retention
 
-Local disk is a short rolling window (2 days). R2 is the archive of record.
+`FRIGATE_RETAIN_DAYS` is the entire policy. Frigate writes continuously and
+evicts the oldest footage once the window is exceeded.
 
-`r2-sync.sh` uses **`rclone copy`, not `sync`** — deliberately. `sync` makes the
-destination match the source exactly *including deletions*, so pointed at a
-rolling local directory it would quietly erase the whole archive each time
-retention lapsed. Expiry belongs to an R2 lifecycle policy:
-
-```
-prefix "record/"  expire after  90 days
-prefix "events/"  expire after 365 days
-```
-
-Set those in the Cloudflare dashboard. They are deliberately not in the repo —
-bucket policy is infrastructure, not code.
+Recording is continuous rather than motion-gated on purpose: broilers move
+constantly, so motion gating rejects almost nothing while making the resulting
+archive harder to reason about. You get the storage cost either way.
 
 ---
 
@@ -142,7 +186,7 @@ tested and none worked, so it is not a known default, but the surface is there.
 - Block port 23 in the router's per-device firewall
 - **Never port-forward it.** RTSP is LAN-only and the camera sits on the same
   flat network as every phone and laptop
-- Rotate the RTSP password if this one has ever been shared in the clear
+- Rotate the RTSP password if it has ever been shared in the clear
 
 ---
 
@@ -150,9 +194,8 @@ tested and none worked, so it is not a known default, but the surface is there.
 
 | Path | Purpose |
 |---|---|
-| `docker-compose.yml` | Frigate + r2-sync sidecar |
+| `docker-compose.yml` | Frigate |
 | `frigate/config.yml` | NVR config — validated against the real schema |
-| `rclone/r2-sync.sh` | Archive pass (`copy`, never `sync`) |
 | `docs/FINDINGS.md` | How the camera was reverse-engineered end to end |
 | `scripts/rtsp_probe.sh` | Find a working RTSP URL on an unknown camera |
 | `scripts/capture.sh` | Pull a clip once a URL is known |
@@ -173,4 +216,5 @@ Credentials come from `$CAM_USER` / `$CAM_PASS` and are never written to disk.
 | `Invalid data found` | forced TCP transport; this camera wants UDP |
 | Connects, no video | `@` in the password needs percent-encoding |
 | `400 Bad Request` | wrong path — only `/onvif1` and `/onvif2` exist |
-| Nothing lands in R2 | Check `docker compose logs r2-sync` — it names the missing `R2_*` variable or rejects the credentials |
+| Disk filling early | `FRIGATE_RETAIN_DAYS` larger than the disk allows |
+| Nothing recorded | Check `docker compose logs frigate`; confirm `FRIGATE_MEDIA_PATH` exists and is writable |
